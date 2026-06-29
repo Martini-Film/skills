@@ -2,29 +2,28 @@
 
 The `blender-to-martini` skill injects this into the user's Blender through the
 Blender MCP (`execute_blender_code`). It renders a CLEAN flythrough along the
-authored camera (the "guide" Seedance follows) plus a first frame, samples the
-camera path, and emits a small JSON result the agent feeds to Martini's
-`render_blender_take` tool.
+authored camera (the "guide" Seedance follows) plus an optional first/last
+frame, samples the camera path, and emits a small JSON result the agent feeds to
+Martini.
 
-It does no networking and touches no credentials: Blender renders, the agent
-carries the bytes to Martini. Media is base64 in the result; we keep it small
-(a 480-720p guide clip + a 720p-class JPEG first frame) so the agent context
-stays cheap.
+Two ops (set CONFIG["op"], default "render"):
 
-Config (the agent fills CONFIG, or sets $MARTINI_TAKE_CONFIG to the same JSON):
-  mode            "follow" (default) | "interpolate"
-  guide_engine    "fast_eevee" (default) | "scene"
-  shot_name       str
-  first_frame     bool (default False)  render + return a first frame in Blender.
-                  Default off: Martini frame-grabs frame 0 of the guide (same
-                  camera, pixel-consistent, one fewer render). Turn ON only for a
-                  materials-rich scene where you want a full scene-engine still.
-  out_json        optional path to also write the result JSON to (test harness)
+  op="render"  Render the guide (+ frames) to files on the Blender host and
+               return their paths + sizes + scene params + camera_path. By
+               default it returns NO base64 — the agent prepares a presigned R2
+               upload (upload_assets_prepare, sized from the reported bytes) and
+               then runs op="put" so the bytes go straight to R2, never through
+               the agent. Set CONFIG["inline"]=True to also return base64 (the
+               small-clip / filesystem-storage fallback for render_blender_take's
+               guideBase64).
 
-Result JSON (printed between ===MARTINI_TAKE_BEGIN/END=== markers):
-  { ok, mode, shot_name, aspect_ratio, duration_seconds, fps, frame_start,
-    frame_end, camera_name, guide_base64, first_frame_base64, last_frame_base64,
-    camera_path }
+  op="put"     Given CONFIG["puts"]=[{"path","url","content_type"}], PUT each
+               file to its presigned URL via urllib (Content-Type only; R2 signs
+               the rest). Returns a per-file status. This is the no-addon,
+               no-credentials upload: the presigned URL carries the auth.
+
+Result JSON is printed between ===MARTINI_TAKE_BEGIN=== / ===MARTINI_TAKE_END===
+markers so the agent can extract it from Blender's noisy stdout.
 """
 
 import base64
@@ -32,6 +31,8 @@ import json
 import math
 import os
 import tempfile
+import urllib.error
+import urllib.request
 
 import bpy
 
@@ -48,12 +49,19 @@ ASPECTS = (
 )
 
 DEFAULTS = {
+    "op": "render",
     "mode": "follow",
     "guide_engine": "fast_eevee",
     "shot_name": "Blender Take",
-    "first_frame": False,  # default: Martini frame-grabs frame 0 of the guide
+    "first_frame": False,  # render a scene-engine first frame (else frame-grabbed in Martini)
+    "inline": False,  # also return base64 (small-clip / filesystem-storage fallback)
     "out_json": None,
 }
+
+GUIDE_FILENAME = "camera-guide.mp4"
+FIRST_FRAME_FILENAME = "first-frame.jpg"
+LAST_FRAME_FILENAME = "last-frame.jpg"
+CAMERA_PATH_FILENAME = "camera-path.json"
 
 
 def _load_config():
@@ -141,6 +149,16 @@ def _b64(path):
         return base64.b64encode(handle.read()).decode("ascii")
 
 
+def _file_ref(path, content_type, filename):
+    """A small descriptor the agent turns into an upload_assets_prepare file entry."""
+    return {
+        "path": path,
+        "filename": filename,
+        "content_type": content_type,
+        "size_bytes": os.path.getsize(path),
+    }
+
+
 def export_take(cfg):
     scene = bpy.context.scene
     camera = _active_camera(scene)
@@ -154,9 +172,9 @@ def export_take(cfg):
     frame_end = min(scene.frame_end, frame_start + max_frames - 1)
     duration = round(max(1, frame_end - frame_start + 1) / fps, 3)
 
-    first_path = os.path.join(out_dir, "first-frame.jpg")
-    last_path = os.path.join(out_dir, "last-frame.jpg")
-    guide_path = os.path.join(out_dir, "camera-guide.mp4")
+    first_path = os.path.join(out_dir, FIRST_FRAME_FILENAME)
+    last_path = os.path.join(out_dir, LAST_FRAME_FILENAME)
+    guide_path = os.path.join(out_dir, GUIDE_FILENAME)
 
     mode = cfg["mode"]
     # Interpolate needs both frames rendered (no guide to grab from). Follow
@@ -186,7 +204,7 @@ def export_take(cfg):
         scene.render.resolution_percentage = 100
         scene.render.film_transparent = False
 
-        # First / last frames at guide-class resolution (keeps base64 small; it's a
+        # First / last frames at guide-class resolution (keeps them small; they're a
         # restyle reference, not the final image). Scene engine = the artist's look.
         _set_output_format(scene.render, "image")
         scene.render.resolution_x = gw
@@ -248,8 +266,20 @@ def export_take(cfg):
         scene.frame_set(saved["frame_current"])
         scene.render.film_transparent = saved["film_transparent"]
 
-    return {
+    # The camera path is written to a file and uploaded as a sidecar of the guide
+    # asset (presigned PUT), so the multi-KB sample blob never rides the agent
+    # context. render_blender_take reads it back by reference (guideAssetId).
+    camera_path_json = os.path.join(out_dir, CAMERA_PATH_FILENAME)
+    with open(camera_path_json, "w", encoding="utf-8") as handle:
+        json.dump(camera_path, handle)
+
+    guide = _file_ref(guide_path, "video/mp4", GUIDE_FILENAME) if mode == "follow" else None
+    first_frame = _file_ref(first_path, "image/jpeg", FIRST_FRAME_FILENAME) if want_first else None
+    last_frame = _file_ref(last_path, "image/jpeg", LAST_FRAME_FILENAME) if want_last else None
+
+    result = {
         "ok": True,
+        "op": "render",
         "mode": mode,
         "shot_name": cfg["shot_name"],
         "aspect_ratio": aspect,
@@ -258,17 +288,62 @@ def export_take(cfg):
         "frame_start": saved["frame_start"],
         "frame_end": saved["frame_end"],
         "camera_name": camera.name,
-        "guide_base64": _b64(guide_path) if mode == "follow" else None,
-        "first_frame_base64": _b64(first_path) if want_first else None,
-        "last_frame_base64": _b64(last_path) if want_last else None,
-        "camera_path": camera_path,
+        "guide": guide,
+        "first_frame": first_frame,
+        "last_frame": last_frame,
+        "camera_path_file": _file_ref(camera_path_json, "application/json", CAMERA_PATH_FILENAME),
     }
+
+    # Fallback path: also return base64 + the full camera_path for
+    # render_blender_take's inline inputs — use only for tiny clips or
+    # filesystem-only local storage where presigned upload isn't available.
+    if bool(cfg.get("inline", False)):
+        result["camera_path"] = camera_path
+        result["inline"] = {
+            "guide_base64": _b64(guide_path) if guide else None,
+            "first_frame_base64": _b64(first_path) if first_frame else None,
+            "last_frame_base64": _b64(last_path) if last_frame else None,
+        }
+
+    return result
+
+
+def put_files(cfg):
+    """PUT already-rendered files to presigned R2 URLs. No credentials needed —
+    the presigned URL carries the signature; we send only Content-Type (R2 signs
+    Content-Length from the body, matching the size given to upload_assets_prepare)."""
+    puts = cfg.get("puts") or []
+    if not isinstance(puts, list) or not puts:
+        raise RuntimeError("op='put' requires CONFIG['puts'] = [{path, url, content_type}, ...]")
+
+    results = []
+    for item in puts:
+        path = item.get("path")
+        url = item.get("url")
+        content_type = item.get("content_type", "application/octet-stream")
+        try:
+            with open(path, "rb") as handle:
+                body = handle.read()
+            request = urllib.request.Request(url, data=body, method="PUT")
+            request.add_header("Content-Type", content_type)
+            with urllib.request.urlopen(request, timeout=180) as response:
+                status = response.status
+            results.append({"path": path, "ok": 200 <= status < 300, "status": status, "size_bytes": len(body)})
+        except urllib.error.HTTPError as exc:
+            results.append({"path": path, "ok": False, "status": exc.code, "error": f"HTTP {exc.code}: {exc.reason}"})
+        except Exception as exc:  # noqa: BLE001 — surface any failure cleanly to the agent
+            results.append({"path": path, "ok": False, "error": str(exc)})
+
+    return {"ok": all(r["ok"] for r in results), "op": "put", "results": results}
 
 
 def main():
     cfg = _load_config()
     try:
-        result = export_take(cfg)
+        if cfg.get("op") == "put":
+            result = put_files(cfg)
+        else:
+            result = export_take(cfg)
     except Exception as exc:  # surface a clean error to the agent
         result = {"ok": False, "error": str(exc)}
 
@@ -282,5 +357,4 @@ def main():
     print("===MARTINI_TAKE_END===")
 
 
-if __name__ == "__main__":
-    main()
+main()

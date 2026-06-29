@@ -96,49 +96,107 @@ for a one-line **first-frame look** (e.g. "rain-slick neon alley, anamorphic") �
 but it's fine to leave blank; the user sets it on the draft in Martini. Do **not**
 ask about model, resolution, or guide engine — defaults are good.
 
-## Step 3 — Ensure a Martini project (Martini MCP)
+## Step 3 — Ensure a Martini project + canvas (Martini MCP)
 
 Use `get_projects` to find the target project if the user named one, else
-`create_project`. Keep the `projectId`.
+`create_project`. Keep the `projectId`. The guide upload needs a canvas, so read
+`get_board_overview` (or `get_board_canvases`) and reuse the first canvas; if the
+project is empty, `create_canvas`. Keep the `canvasId`.
 
-## Step 4 — Render the take (Blender MCP)
+## Step 4 — Render the guide (Blender MCP)
 
 Read `export_take.py` from this skill directory and run it via Blender MCP,
-injecting a `CONFIG` dict (prepend it to the script source). It renders **only a
-clean guide flythrough** (by default — the first frame is grabbed server-side
-from frame 0 of the guide, so it's pixel-consistent and needs no extra render),
-samples the full camera path, and prints a JSON result between
-`===MARTINI_TAKE_BEGIN===` / `===MARTINI_TAKE_END===`.
+injecting a `CONFIG` dict (prepend it to the script source). The default op
+(`render`) renders a **clean guide flythrough** to a file on the Blender host
+(the first frame is grabbed server-side from frame 0 of the guide, so it's
+pixel-consistent and needs no extra render), samples the full camera path, and
+prints a JSON result between `===MARTINI_TAKE_BEGIN===` / `===MARTINI_TAKE_END===`.
+It returns **file paths + sizes, not base64** — the bytes go straight to R2 in
+Step 4b, never through you.
 
 Prepend, then send the whole thing to `execute_blender_code`:
 
 ```python
-CONFIG = {"mode": "follow", "guide_engine": "fast_eevee", "shot_name": "<shot name>"}
+CONFIG = {"op": "render", "mode": "follow", "guide_engine": "fast_eevee", "shot_name": "<shot name>"}
 # …contents of export_take.py follow…
 ```
 
-Extract the JSON between the markers. If `ok` is false, surface `error` to the
-user. `guide_base64` is a small 480-720p clip (~100-150 KB); `first_frame_base64`
-is normally `null` (frame-grab). **Opt-in:** for a materials-rich scene where you
-want a full scene-engine first frame, set `CONFIG["first_frame"] = True` and the
-script returns `first_frame_base64` too.
+Extract the JSON. If `ok` is false, surface `error`. You get
+`result.guide = {path, filename, content_type, size_bytes}` (a ~100-300 KB
+480-720p clip), `result.camera_path_file = {path, filename, content_type,
+size_bytes}` (the authored camera move, written to disk for upload — not inlined),
+and the scene params. `first_frame` is normally `null` (frame-grab); set
+`CONFIG["first_frame"] = True` for a materials-rich scene where you want a full
+scene-engine first frame.
+
+### Step 4a — Prepare the uploads (Martini MCP)
+
+Ask Martini for a presigned R2 PUT URL for the guide, sized from the render:
+
+```
+upload_assets_prepare(
+  projectId: <projectId>,
+  canvasId:  <canvasId>,
+  files: [{ filename: <result.guide.filename>, contentType: "video/mp4", sizeBytes: <result.guide.size_bytes> }],
+)
+```
+
+Keep `assetId` (the **guideAssetId**) and `uploadUrl` from `results[0]`. Then
+presign the camera path as a sidecar of that guide asset:
+
+```
+prepare_blender_camera_path_upload(
+  projectId:    <projectId>,
+  guideAssetId: <assetId>,
+  sizeBytes:    <result.camera_path_file.size_bytes>,
+)
+```
+
+Keep its `uploadUrl` (the camera-path PUT URL). If either `directUpload` is
+`false` (filesystem-only local storage with no presign), fall back: re-run Step 4
+with `CONFIG["inline"] = True` and pass `result.inline.guide_base64` as
+`guideBase64` and `result.camera_path` as `cameraPath` to `render_blender_take`
+(Steps 4b–4c are then skipped).
+
+### Step 4b — Upload the bytes (Blender MCP, `op="put"`)
+
+Run `export_take.py` again with the put op so Blender PUTs both files straight to
+R2 in one call (no credentials — the presigned URLs carry the signature):
+
+```python
+CONFIG = {"op": "put", "puts": [
+  {"path": "<result.guide.path>", "url": "<guide uploadUrl>", "content_type": "video/mp4"},
+  {"path": "<result.camera_path_file.path>", "url": "<camera-path uploadUrl>", "content_type": "application/json"},
+]}
+# …contents of export_take.py follow…
+```
+
+Confirm every `results[*].ok` is true (HTTP 2xx). If not, surface the error.
+
+### Step 4c — Complete the upload (Martini MCP → `upload_assets_complete`)
+
+```
+upload_assets_complete(projectId: <projectId>, assetIds: [<guideAssetId>])
+```
+
+This lands the guide as a first-class **video node** (thumbnail + proxy). The
+camera-path sidecar needs no completion — it rides in the guide asset's folder.
 
 ## Step 5 — Import into Martini (Martini MCP → `render_blender_take`)
 
-Call `render_blender_take` with the guide and the parsed scene params.
-**Always `autoRender: false`** (draft-first). Pass `firstFrameBase64` only if the
-script returned one (the opt-in case); otherwise omit it — Martini grabs the
-first frame from the guide.
+Reference the uploaded guide by id — no base64, no inline camera path.
+`render_blender_take` **reuses** the existing guide asset (it won't re-land a
+duplicate) and reads the camera path from the guide's sidecar by reference.
+**Always `autoRender: false`** (draft-first).
 
 ```
 render_blender_take(
   projectId:        <projectId>,
-  guideBase64:      <result.guide_base64>,
-  firstFrameBase64: <result.first_frame_base64 or omit>,   # usually omitted (frame-grab)
+  canvasId:         <canvasId>,
+  guideAssetId:     <guideAssetId>,         # reused, not duplicated; its camera-path.json sidecar is read automatically
   shotName:         <result.shot_name>,
   durationSeconds:  <result.duration_seconds>,
   aspectRatio:      <result.aspect_ratio>,
-  cameraPath:       <result.camera_path>,   # preserves the authored move on the shot
   mode:             "follow",
   model:            "seedance-2.0",
   skipStartingFrame: false,          # two-stage: art-direct the first frame
@@ -147,14 +205,16 @@ render_blender_take(
 )
 ```
 
-The tool decodes the guide server-side, lands it as a **video node on the
-canvas**, grabs frame 0 as the **first-frame draft** (unless you supplied one),
-creates the **animate shot draft**, adds a guidance note, and lays the nodes out
-tidily ([first frame] [shot] / [guide]). It returns `projectUrl`.
+It grabs frame 0 as the **first-frame draft**, creates the **animate shot
+draft**, adds a guidance note, lays the nodes out tidily, and stamps the authored
+camera move onto the shot (read from the guide's `camera-path.json` sidecar). It
+returns `projectUrl`. (You can still pass `cameraPath` inline to override the
+sidecar — the filesystem-storage fallback above does exactly that.)
 
-For the `interpolate` mode (first + last frame, no camera follow), the script
-renders both frames — pass `firstFrameBase64` + `lastFrameBase64` and
-`mode: "interpolate"`.
+For the `interpolate` mode (first + last frame, no camera follow), the render op
+also writes both frames; upload each via the same prepare → put → complete dance
+(contentType `image/jpeg`) and pass `firstFrameAssetId` + `lastFrameAssetId` with
+`mode: "interpolate"`. (For tiny images the base64 inputs are also fine.)
 
 ## Step 6 — Hand off
 
@@ -169,12 +229,18 @@ Give the user the `projectUrl` and the next step, e.g.:
 
 ## Notes
 
-- **Why base64:** the guide + frame are small, so passing them through the agent
-  is cheap and keeps Blender stateless (no auth, no upload code). At scale, the
-  same `render_blender_take` can take presigned-upload URLs instead (Blender PUTs
-  bytes straight to R2) — a future optimization, not needed for correctness.
-- **Camera path** is preserved on the import for provenance; the faithful render
-  rides the guide video, not re-derived coordinates.
+- **Why presigned R2 (not base64):** the guide is a video and the camera path is
+  a multi-KB JSON blob — both too large to push through the agent context
+  reliably. `upload_assets_prepare` (guide) and `prepare_blender_camera_path_upload`
+  (camera path) return presigned PUT URLs and Blender uploads the bytes directly to
+  R2; the URLs carry the auth, so Blender stays credential-free. The
+  `guideBase64` / `firstFrameBase64` inputs and inline `cameraPath` remain as a
+  fallback for tiny clips or filesystem-only local storage (Step 4a's
+  `directUpload:false` branch).
+- **Camera path** is preserved on the import for provenance (the faithful render
+  rides the guide video, not re-derived coordinates). It's stored as a
+  `camera-path.json` sidecar in the guide asset's R2 folder and read back by
+  reference (`guideAssetId`) at import — never inlined through the agent.
 - **This replaces the Blender addon.** The addon was a logged-in API client whose
   auth/distribution/version drift caused most of its bugs; this skill needs none
   of that. Non-agent hand-artists (no Blender MCP) use Martini's web file-drop.
