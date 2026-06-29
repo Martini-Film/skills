@@ -12,8 +12,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Create zip
-        run: zip -j martini-skills.zip martini-skills/SKILL.md martini-skills/playbook.md
+      - name: Create zips
+        run: |
+          zip -j martini-skills.zip martini-skills/SKILL.md martini-skills/playbook.md
+          zip -j blender-to-martini.zip blender-to-martini/SKILL.md blender-to-martini/export_take.py
 
       - name: Get short SHA
         id: sha
@@ -24,4 +26,6 @@ jobs:
         with:
           tag_name: ${{ steps.sha.outputs.short }}
           name: ${{ steps.sha.outputs.short }}
-          files: martini-skills.zip
+          files: |
+            martini-skills.zip
+            blender-to-martini.zip
