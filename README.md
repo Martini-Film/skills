@@ -14,6 +14,49 @@ Code, a `$name` skill in Codex, or anywhere else that reads the skill format.
 | [`martini-skills`](martini-skills/) | The core filmmaking guide — generate shots and images, keep characters consistent across shots with Subjects, build a board from a script, batch-produce, and iterate. Covers the Subject/@Element prompt convention, model selection, async generation jobs, and credit (olive) cost. Reads `playbook.md` for larger build-outs. |
 | [`blender-to-martini`](blender-to-martini/) | Take a Blender viewport shot (blockout + keyframed camera) into Martini as an editable, camera-faithful draft — entirely through the Blender MCP + Martini MCP, with no Blender addon and no credentials in Blender. Ships `export_take.py`, the Blender-side render script the skill runs. |
 
+## Install
+
+**Claude Code and Codex are the best fit** — these skills drive Martini agentically
+over MCP, which is what a CLI/IDE agent is built for. Claude Desktop works too
+(see below), but the agentic flows shine in a coding-agent harness.
+
+### Claude Code / Codex (recommended)
+
+Install with the [`skills`](https://github.com/vercel-labs/skills) CLI. This grabs
+both skills and drops them into the agent's skills directory:
+
+```bash
+# Claude Code, installed globally (~/.claude/skills)
+npx -y skills add github.com/Martini-Film/skills --global --agent claude-code --yes
+
+# Codex
+npx -y skills add github.com/Martini-Film/skills --global --agent codex --yes
+```
+
+Install into multiple agents at once by repeating `--agent`, or drop `--global` to
+install into the current project (`.claude/skills/`) instead. To install just one
+skill from the repo, add `--skill`:
+
+```bash
+npx -y skills add github.com/Martini-Film/skills --skill blender-to-martini --global --agent claude-code --yes
+```
+
+To update, re-run the same command. (`skills` supports many more agents — Cursor,
+OpenCode, and others — via the same `--agent` flag.)
+
+You'll also need the **Martini MCP** connected so the skill has tools to call —
+in Claude Code: `claude mcp add --transport http --scope user martini https://www.martini.film/mcp`.
+
+### Claude Desktop / Claude.ai
+
+The `skills` CLI targets CLI/IDE agents, not Claude Desktop. To use a skill there,
+install it manually:
+
+1. Download the skill zip from the [latest release](../../releases/latest) —
+   `martini-skills.zip` or `blender-to-martini.zip`.
+2. Add it as a Skill in Claude Desktop (Settings → Capabilities/Skills → upload the zip).
+3. Connect the Martini MCP connector so the skill has tools to call.
+
 ## Layout
 
 Each skill lives in its own top-level directory:
